@@ -7,7 +7,7 @@ let package = Package(
     name: "XCLogParser",
     platforms: [.macOS(.v10_13)],
     products: [
-    	.executable(name: "xclogparser", targets: ["XCLogParserApp"]),
+    	.executable(name: "xclogparser_cli", targets: ["XCLogParserApp"]),
         .library(name: "XCLogParser", targets: ["XCLogParser"])
     ],
     dependencies: [
