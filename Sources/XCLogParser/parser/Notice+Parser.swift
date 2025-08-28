@@ -37,14 +37,23 @@ extension Notice {
         if truncLargeIssues && logSection.messages.count > 100 {
             logSection = self.logSectionWithTruncatedIssues(logSection: logSection)
         }
+        // Pre-scan message ranges in text to align flags with messages
+        let messageRanges = self.buildMessageRangesInText(messages: logSection.messages, text: logSection.text)
+
         // we look for clangWarnings parsing the text of the logSection
-        let clangWarningsFlags = self.parseClangWarningFlags(text: logSection.text)
+        let clangWarningsFlags = self.parseClangWarningFlags(text: logSection.text,
+                                                              messages: logSection.messages,
+                                                              messageRanges: messageRanges)
         let clangWarnings = self.parseClangWarnings(clangFlags: clangWarningsFlags, logSection: logSection)
 
+        let flaggedMessageIndexes: Set<Int> = Set(clangWarningsFlags.enumerated().compactMap { (idx, flags) in
+            flags.isEmpty ? nil : idx
+        })
+        
         // Remove the messages that were categorized as clangWarnings
-        let remainingLogMessages = logSection.messages.filter { message in
-            return clangWarnings.contains { $0.title == message.title } == false
-        }
+        let remainingLogMessages = logSection.messages.enumerated()
+            .filter { (idx, _) in flaggedMessageIndexes.contains(idx) == false }
+            .map { $0.element }
         // parse details for Swift issues
         let swiftErrorDetails = parseSwiftIssuesDetailsByLocation(logSection.text)
         // we look for analyzer warnings, swift warnings, notes and errors
@@ -143,27 +152,81 @@ extension Notice {
         }
     }
 
-    /// Parses the text of a IDELogSection looking for the pattern [-Wwarning-type]
-    /// that means there was a clang warning.
-    /// - parameter text: IDELogSection text property
-    /// - returns: A list of clang warning flags found in the text, like -Wunused-function
-    private static func parseClangWarningFlags(text: String) -> [String]? {
-        guard let clangWarningRegexp = Notice.clangWarningRegexp else {
-            return nil
+    /// Find message ranges in the section text using a monotonic forward search for stability and O(n) behavior.
+    /// For each message, look up its title in the remaining text window. If not found, record nil to keep alignment.
+    private static func buildMessageRangesInText(messages: [IDEActivityLogMessage], text: String) -> [Range<String.Index>?] {
+        var ranges = [Range<String.Index>?]()
+        if messages.isEmpty {
+            return ranges
         }
-        let range = NSRange(location: 0, length: text.count)
-        let matches = clangWarningRegexp.matches(in: text, options: .reportCompletion, range: range)
-        return matches.map { result -> String in
-            String(text.substring(result.range))
+        var searchStart = text.startIndex
+        for message in messages {
+            let needle = message.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if needle.isEmpty {
+                ranges.append(nil)
+                continue
+            }
+            if let found = text.range(of: needle, options: [.caseInsensitive], range: searchStart..<text.endIndex) {
+                ranges.append(found)
+                searchStart = found.upperBound
+            } else {
+                ranges.append(nil)
+            }
         }
+        return ranges
     }
 
-    private static func parseClangWarnings(clangFlags: [String]?, logSection: IDEActivityLogSection) -> [Notice] {
-        guard let clangFlags = clangFlags else {
-            return [Notice]()
+    /// Parses the text of a IDELogSection looking for the pattern [-Wwarning-type]
+    /// that means there was a clang warning.
+    /// - returns: [[String]] aligned with messages. A message may have multiple flags; if none, bucket is empty.
+    private static func parseClangWarningFlags(text: String,
+                                               messages: [IDEActivityLogMessage],
+                                               messageRanges: [Range<String.Index>?]) -> [[String]] {
+        if messages.isEmpty {
+            return []
         }
-        return zip(logSection.messages, clangFlags)
-            .compactMap { (message, warningFlag) -> Notice? in
+        guard let clangWarningRegexp = Notice.clangWarningRegexp else {
+            return Array(repeating: [], count: messages.count)
+        }
+        let nsText = text as NSString
+        let full = NSRange(location: 0, length: nsText.length)
+        let matches = clangWarningRegexp.matches(in: text, options: .reportCompletion, range: full)
+        struct FlagHit { let range: NSRange; let flag: String }
+        let hits: [FlagHit] = matches.map { m in FlagHit(range: m.range, flag: nsText.substring(with: m.range)) }
+
+        let messageNSRanges: [NSRange?] = messageRanges.map { r -> NSRange? in
+            guard let r = r else { return nil }
+            return NSRange(r, in: text)
+        }
+
+        var buckets = Array(repeating: [String](), count: messages.count)
+        for hit in hits {
+            var bestIdx: Int? = nil
+            var bestDist = Int.max
+            for (idx, mRange) in messageNSRanges.enumerated() {
+                guard let mr = mRange else { continue }
+                if NSLocationInRange(hit.range.location, mr) {
+                    bestIdx = idx
+                    bestDist = 0
+                    break
+                } else {
+                    let dist = abs(hit.range.location - mr.location)
+                    if dist < bestDist {
+                        bestDist = dist
+                        bestIdx = idx
+                    }
+                }
+            }
+            if let i = bestIdx { buckets[i].append(hit.flag) }
+        }
+        return buckets
+    }
+
+    private static func parseClangWarnings(clangFlags: [[String]], logSection: IDEActivityLogSection) -> [Notice] {
+        var results: [Notice] = []
+        for (idx, message) in logSection.messages.enumerated() {
+            let flags = idx < clangFlags.count ? clangFlags[idx] : []
+            for warningFlag in flags {
                 // If the warning is treated as error, we marked the issue as error
                 let type: NoticeType = warningFlag.contains("-Werror") ? .clangError : .clangWarning
                 let notice = Notice(withType: type, logMessage: message, clangFlag: warningFlag)
@@ -173,12 +236,15 @@ extension Notice {
                     // Fixes a bug where Xcode logs add more than one message to report one
                     // deprecation warning. Only one has the right documentURL
                     if notice.documentURL != logSection.location.documentURLString {
-                        return nil
+                        continue
                     }
-                    return notice.with(type: .deprecatedWarning)
+                    results.append(notice.with(type: .deprecatedWarning))
+                } else if let notice = notice {
+                    results.append(notice)
                 }
-                return notice
+            }
         }
+        return results
     }
 
     private static func isDeprecatedWarning(type: NoticeType, text: String, clangFlags: String?) -> Bool {
